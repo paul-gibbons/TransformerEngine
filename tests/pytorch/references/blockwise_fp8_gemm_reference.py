@@ -195,7 +195,7 @@ class CuBLASRefBlockwiseGemm:
                     # Perform qgemm with scaling factors fused in the GEMM
                     # Accumulate should be in float32 format, which aligns with the split_accumulate in FP8 GEMM
                     one = torch.tensor(1.0, dtype=torch.float32, device=qx.device)
-                    y_partial = torch._scaled_mm(
+                    scaled_mm_res = torch._scaled_mm(
                         qx_block,
                         qw_block.t(),
                         scale_a=one,
@@ -203,7 +203,7 @@ class CuBLASRefBlockwiseGemm:
                         out_dtype=torch.float32,
                         use_fast_accum=not use_split_accumulator,
                     )
-
+                    y_partial = scaled_mm_res[0] if isinstance(scaled_mm_res, tuple) else scaled_mm_res
                     # Accumulate the partial result
                     if is_a_1d_scaled and is_b_1d_scaled:
                         # 1Dx1D
