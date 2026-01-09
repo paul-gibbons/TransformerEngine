@@ -22,6 +22,7 @@ from transformer_engine.debug.features.utils import next_enabled_iter, get_reduc
 from transformer_engine.debug.features.utils.stats_computation import (
     add_max_blockwise_dynamic_range_stats,
     BlockwiseDynamicRangeStat,
+    parse_num_zeros_stat,
 )
 
 
@@ -55,6 +56,10 @@ class LogTensorStats(BaseLogTensorStats):
 
                 - block_size: int, default = 32
                 - dims: int, default = 1, allowed values are 1 and 2
+            - num_zeros: count of exact zeros
+            - num_zeros%: percentage of exact zeros
+            - num_zeros[threshold]: count of values where |x| < threshold
+            - num_zeros[threshold]%: percentage of values where |x| < threshold
 
     tensors/tensors_struct: List[str]
         list of tensors to log
@@ -119,6 +124,8 @@ class LogTensorStats(BaseLogTensorStats):
                 if block_size > 0 and dims in [1, 2]:
                     return True
             return False
+        if parse_num_zeros_stat(stat) is not None:
+            return True
         return stat in BaseLogTensorStats._get_supported_stats_list(None) | {
             "cur_amax",
             "dynamic_range",
@@ -155,7 +162,12 @@ class LogTensorStats(BaseLogTensorStats):
 
     def _get_supported_stats_list(self):
         """Returns stats this feature can log."""
-        return BaseLogTensorStats._get_supported_stats_list(None) | {"cur_amax", "dynamic_range"}
+        return BaseLogTensorStats._get_supported_stats_list(None) | {
+            "cur_amax",
+            "dynamic_range",
+            "num_zeros",
+            "num_zeros%",
+        }
 
     @api_method
     def inspect_tensor_enabled(

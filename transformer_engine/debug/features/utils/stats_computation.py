@@ -7,12 +7,28 @@ Mathematical functions used to tensor statistics computation.
 """
 
 import math
+import re
 from collections import namedtuple
+from typing import Optional, Tuple
 
 import torch
 import torch.nn.functional as F
 import transformer_engine_torch as tex
 from transformer_engine.common.recipe import Format
+
+_NUM_ZEROS_PATTERN = re.compile(r'^num_zeros(?:\[([^\]]+)\])?(%)?$', re.IGNORECASE)
+
+
+def parse_num_zeros_stat(stat: str) -> Optional[Tuple[float, bool]]:
+    """Parse a num_zeros stat string and return (threshold, is_percentage).
+    
+    Returns None if the stat is not a num_zeros variant.
+    """
+    match = _NUM_ZEROS_PATTERN.match(stat.strip())
+    if not match:
+        return None
+    threshold_str, pct_suffix = match.groups()
+    return (float(threshold_str) if threshold_str else 0.0, pct_suffix is not None)
 
 
 class BlockwiseDynamicRangeStat(

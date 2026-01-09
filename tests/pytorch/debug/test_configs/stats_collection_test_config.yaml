@@ -39,7 +39,7 @@ stat_collection_test_2:
           start_step: 100
           end_step: 500
         - tensor: weight
-          stats: [mean, std, l1_norm, min, max]
+          stats: [mean, std, l1_norm, min, max, num_zeros%, "num_zeros[1e-6]%"]
           freq: 5
           start_step: 100
           end_step: 500

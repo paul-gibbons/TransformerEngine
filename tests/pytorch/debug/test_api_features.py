@@ -302,7 +302,8 @@ def test_statistics_collection(configs_dir, feature_dirs):
         )[0]
 
         # Second config in same yaml
-        tensor = torch.rand((100, 100, 5)).cuda()
+        tensor = torch.ones((100, 100, 5), device="cuda")
+        tensor.view(-1)[:10] = 1e-7
         debug_api.transformer_engine.inspect_tensor(
             "decoder.6.mlp.fc1",
             tensor_name="activation",
@@ -314,8 +315,8 @@ def test_statistics_collection(configs_dir, feature_dirs):
             columnwise_quantized_tensor=tensor_fp8,
         )
         stats = log()
-        stats_names = [x[3] for x in stats.keys()]
-        all(s in stats_names for s in ["cur_amax", "dynamic_range", "mean", "std", "l1_norm"])
+        stats_names = [x[2] for x in stats.keys()]
+        assert all(s in stats_names for s in ["cur_amax", "dynamic_range", "mean", "std", "l1_norm"])
         torch.testing.assert_close(
             stats[("decoder.6.mlp.fc1", "activation", "mean", 200)], tensor.mean()
         )
@@ -331,9 +332,14 @@ def test_statistics_collection(configs_dir, feature_dirs):
             columnwise_quantized_tensor=tensor_fp8,
         )
         stats = log()
-        stats_names = [x[3] for x in stats.keys()]
-        all(s in stats_names for s in ["mean", "std", "l1_norm", "min", "max"])
+        stats_names = [x[2] for x in stats.keys()]
+        assert all(s in stats_names for s in ["mean", "std", "l1_norm", "min", "max"])
         torch.testing.assert_close(stats[("decoder.7.mlp.fc1", "weight", "max", 200)], tensor.max())
+        assert stats[("decoder.7.mlp.fc1", "weight", "num_zeros%", 200)] == 0.0
+        expected_close_to_zero = (tensor.abs() < 1e-6).sum().item() / tensor.numel() * 100
+        torch.testing.assert_close(
+            stats[("decoder.7.mlp.fc1", "weight", "num_zeros[1e-06]%", 200)], expected_close_to_zero
+        )
 
         assert not debug_api.transformer_engine.inspect_tensor_enabled(
             "decoder.7.mlp.fc1", tensor_name="weight", iteration=201
