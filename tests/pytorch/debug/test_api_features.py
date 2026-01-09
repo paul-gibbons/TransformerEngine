@@ -316,7 +316,9 @@ def test_statistics_collection(configs_dir, feature_dirs):
         )
         stats = log()
         stats_names = [x[2] for x in stats.keys()]
-        assert all(s in stats_names for s in ["cur_amax", "dynamic_range", "mean", "std", "l1_norm"])
+        assert all(
+            s in stats_names for s in ["cur_amax", "dynamic_range", "mean", "std", "l1_norm"]
+        )
         torch.testing.assert_close(
             stats[("decoder.6.mlp.fc1", "activation", "mean", 200)], tensor.mean()
         )
@@ -335,10 +337,13 @@ def test_statistics_collection(configs_dir, feature_dirs):
         stats_names = [x[2] for x in stats.keys()]
         assert all(s in stats_names for s in ["mean", "std", "l1_norm", "min", "max"])
         torch.testing.assert_close(stats[("decoder.7.mlp.fc1", "weight", "max", 200)], tensor.max())
-        assert stats[("decoder.7.mlp.fc1", "weight", "num_zeros%", 200)] == 0.0
-        expected_close_to_zero = (tensor.abs() < 1e-6).sum().item() / tensor.numel() * 100
         torch.testing.assert_close(
-            stats[("decoder.7.mlp.fc1", "weight", "num_zeros[1e-06]%", 200)], expected_close_to_zero
+            stats[("decoder.7.mlp.fc1", "weight", "num_zeros%", 200)],
+            torch.tensor(0.0, device="cuda"),
+        )
+        expected_close_to_zero = (tensor.abs() < 1e-10).sum() / tensor.numel() * 100
+        torch.testing.assert_close(
+            stats[("decoder.7.mlp.fc1", "weight", "num_zeros[1e-10]%", 200)], expected_close_to_zero
         )
 
         assert not debug_api.transformer_engine.inspect_tensor_enabled(

@@ -16,19 +16,26 @@ import torch.nn.functional as F
 import transformer_engine_torch as tex
 from transformer_engine.common.recipe import Format
 
-_NUM_ZEROS_PATTERN = re.compile(r'^num_zeros(?:\[([^\]]+)\])?(%)?$', re.IGNORECASE)
+_NUM_ZEROS_PATTERN = re.compile(r"^num_zeros(?:\[([^\]]+)\])?(%)?$", re.IGNORECASE)
 
 
 def parse_num_zeros_stat(stat: str) -> Optional[Tuple[float, bool]]:
     """Parse a num_zeros stat string and return (threshold, is_percentage).
-    
+
     Returns None if the stat is not a num_zeros variant.
     """
     match = _NUM_ZEROS_PATTERN.match(stat.strip())
     if not match:
         return None
     threshold_str, pct_suffix = match.groups()
-    return (float(threshold_str) if threshold_str else 0.0, pct_suffix is not None)
+    if threshold_str:
+        try:
+            threshold = float(threshold_str)
+        except ValueError:
+            return None
+    else:
+        threshold = 0.0
+    return (threshold, pct_suffix is not None)
 
 
 class BlockwiseDynamicRangeStat(
@@ -448,6 +455,44 @@ def add_max_blockwise_dynamic_range_stats(
     return stat_key
 
 
+def add_num_zeros_stats(threshold: float):
+    """Register num_zeros and num_zeros% stats for a given threshold."""
+    threshold_str = "" if threshold == 0.0 else f"[{threshold:g}]"
+    stat_count = f"num_zeros{threshold_str}"
+    stat_pct = f"num_zeros{threshold_str}%"
+
+    if stat_count in stats_to_num:
+        return stat_count, stat_pct
+
+    stats_to_num[stat_count] = len(stats_to_num)
+    stats_to_num[stat_pct] = len(stats_to_num)
+
+    if threshold == 0.0:
+        STATS[stat_count] = (
+            lambda x, aux_dict: (x == 0).sum(),
+            lambda buffers, _sn=stat_count: sum(_get(buffers, _sn)),
+        )
+    else:
+        STATS[stat_count] = (
+            lambda x, aux_dict, _thr=threshold: (x.abs() < _thr).sum(),
+            lambda buffers, _sn=stat_count: sum(_get(buffers, _sn)),
+        )
+
+    STATS[stat_pct] = (
+        lambda x, aux_dict, _sn_count=stat_count: STATS[_sn_count][0](x, aux_dict)
+        / x.numel()
+        * 100,
+        lambda buffers, _sn_count=stat_count: 100
+        * sum(_get(buffers, _sn_count))
+        / sum(_get(buffers, "numel")),
+    )
+
+    DEPENDENCIES[stat_count] = {stat_count}
+    DEPENDENCIES[stat_pct] = {stat_count, "numel"}
+
+    return stat_count, stat_pct
+
+
 for _columnwise in [True, False]:
     for _recipe_name in [
         "",  # default recipe
@@ -459,3 +504,5 @@ for _columnwise in [True, False]:
         add_underflows_stats(_recipe_name, _columnwise)
         add_scale_inv_stats(_recipe_name, _columnwise)
         add_mse_stats(_recipe_name, _columnwise)
+
+add_num_zeros_stats(0.0)

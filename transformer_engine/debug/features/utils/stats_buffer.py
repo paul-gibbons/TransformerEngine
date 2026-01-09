@@ -21,6 +21,7 @@ from transformer_engine.debug.features.utils.stats_computation import (
     DEPENDENCIES,
     stats_to_num,
     parse_num_zeros_stat,
+    add_num_zeros_stats,
 )
 from transformer_engine.debug.pytorch.debug_state import TEDebugState
 
@@ -38,10 +39,18 @@ class _Buffer:
         self.reduce_within_microbatch = reduce_within_microbatch
         self.stats_to_log = stats
 
+        self._stat_name_mapping = {}
         self.stats_to_compute = set()
         for stat in stats:
-            if isinstance(stat, str) and parse_num_zeros_stat(stat) is not None:
-                continue
+            if isinstance(stat, str):
+                parsed = parse_num_zeros_stat(stat)
+                if parsed is not None:
+                    threshold, is_pct = parsed
+                    stat_count, stat_pct = add_num_zeros_stats(threshold)
+                    registered_stat = stat_pct if is_pct else stat_count
+                    self._stat_name_mapping[stat] = registered_stat
+                    self.stats_to_compute = self.stats_to_compute | DEPENDENCIES[registered_stat]
+                    continue
             self.stats_to_compute = self.stats_to_compute | DEPENDENCIES[stat]
 
         self._buffer = torch.zeros(len(STATS), dtype=torch.float32).cuda()
@@ -55,20 +64,9 @@ class _Buffer:
         self.iteration = None
         self.skip_reduction = False
 
-        self._num_zeros_thresholds = set()
-        self._num_zeros = {}
-        self._num_zeros_numel = 0
-        for stat in stats:
-            if isinstance(stat, str):
-                parsed = parse_num_zeros_stat(stat)
-                if parsed is not None:
-                    self._num_zeros_thresholds.add(parsed[0])
-
     def _reset_before_next_step(self):
         """Resets the state after the logging."""
         self.modified[0] = False
-        self._num_zeros.clear()
-        self._num_zeros_numel = 0
 
     def _gather_helper_stats(self) -> torch.Tensor:
         """
@@ -129,23 +127,6 @@ class _Buffer:
 
         self._buffer.copy_(self._new_buffer)
 
-        if self._num_zeros_thresholds:
-            if hasattr(tensor, "numel"):
-                tensor_data = tensor
-                numel = tensor.numel()
-            else:
-                tensor_data = tensor.get_data_tensors()[0]
-                numel = tensor_data.numel()
-
-            abs_tensor = tensor_data.abs()
-            self._num_zeros_numel += numel
-            for threshold in self._num_zeros_thresholds:
-                if threshold == 0.0:
-                    count = (tensor_data == 0).sum().item()
-                else:
-                    count = (abs_tensor < threshold).sum().item()
-                self._num_zeros[threshold] = self._num_zeros.get(threshold, 0) + count
-
         self.modified[0] = True
 
     def log(self):
@@ -159,10 +140,11 @@ class _Buffer:
             return {}
         output = {}
         for stat_name in self.stats_to_log:
-            parsed = parse_num_zeros_stat(stat_name) if isinstance(stat_name, str) else None
-            if parsed is not None:
-                stat_value = self._compute_num_zeros_stat(parsed)
-                stat_name_str = self._format_num_zeros_stat_name(parsed)
+            if stat_name in self._stat_name_mapping:
+                registered_stat = self._stat_name_mapping[stat_name]
+                combiner = STATS[registered_stat][1]
+                stat_value = combiner(gathered_helper_stats)
+                stat_name_str = registered_stat
             else:
                 combiner = STATS[stat_name][1]
                 stat_value = combiner(gathered_helper_stats)
@@ -172,24 +154,11 @@ class _Buffer:
             MetricLogger.log_scalar(
                 f"{self.layer_name}_{self.tensor_name}_{stat_name_str}", stat_value, self.iteration
             )
-            output_key = stat_name_str if parsed is not None else stat_name
-            output[(self.layer_name, self.tensor_name, output_key, self.iteration)] = (
+            output[(self.layer_name, self.tensor_name, stat_name_str, self.iteration)] = (
                 stat_value  # for debugging purposes
             )
         self._reset_before_next_step()
         return output
-
-    def _compute_num_zeros_stat(self, parsed):
-        threshold, is_pct = parsed
-        count = self._num_zeros.get(threshold, 0)
-        if is_pct:
-            return (count / self._num_zeros_numel * 100) if self._num_zeros_numel > 0 else 0.0
-        return count
-
-    def _format_num_zeros_stat_name(self, parsed):
-        threshold, is_pct = parsed
-        threshold_str = "" if threshold == 0.0 else f"[{threshold:g}]"
-        return f"num_zeros{threshold_str}%" if is_pct else f"num_zeros{threshold_str}"
 
 
 class StatsBuffers:
