@@ -530,4 +530,9 @@ class TransformerEngineAPI(BaseNamespaceAPI):
 
     def end_debug(self):
         """This function is called by the nvidia-dlframework-inspect after every debug_api.end_debug()"""
+        from transformer_engine.debug.features.log_nvfp4_tensor_stats import (
+            _OSCILLATION_PERSISTENT_STATE,
+        )
+
+        _OSCILLATION_PERSISTENT_STATE.clear()
         TEDebugState._reset()

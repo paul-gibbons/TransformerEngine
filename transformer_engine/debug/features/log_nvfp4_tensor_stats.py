@@ -18,7 +18,12 @@ from transformer_engine.debug.features.utils.stats_buffer import STATS_BUFFERS
 from transformer_engine.pytorch.tensor import Quantizer, QuantizedTensor
 from transformer_engine.pytorch.tensor.nvfp4_tensor import NVFP4Quantizer
 from transformer_engine.debug.features.utils import get_reduction_params, next_enabled_iter
+from transformer_engine.debug.features.utils.stats_computation import OSCILLATION_STAT_NAMES
 from transformer_engine.pytorch.tensor.storage.nvfp4_tensor_storage import NVFP4TensorStorage
+
+# Module-level persistent state for oscillation EMA, keyed by (layer_name, tensor_name).
+# Survives across log() resets; cleared on end_debug().
+_OSCILLATION_PERSISTENT_STATE: Dict[tuple, dict] = {}
 
 
 @Registry.register_feature(namespace="transformer_engine")
@@ -89,14 +94,20 @@ class LogNvfp4TensorStats(BaseLogTensorStats):
             "underflows%",
             "mse",
         ]
-        if stat not in supported_stats:
-            raise ValueError(
-                f"Stat {stat} is not supported for NVFP4. Supported stats: {supported_stats}"
-            )
-        return True
+        if stat in OSCILLATION_STAT_NAMES or stat in supported_stats:
+            return True
+        raise ValueError(
+            f"Stat {stat} is not supported for NVFP4. Supported stats: "
+            f"{supported_stats + list(OSCILLATION_STAT_NAMES)}"
+        )
 
     def get_stat_with_prefix(self, stat: str) -> str:
-        """Add nvfp4_ prefix to stat name for use in stats_computation."""
+        """Add nvfp4_ prefix to stat name for use in stats_computation.
+
+        Oscillation stats are registered without prefix and used as-is.
+        """
+        if stat in OSCILLATION_STAT_NAMES:
+            return stat
         return f"nvfp4_{stat}"
 
     @contextmanager
@@ -220,6 +231,19 @@ class LogNvfp4TensorStats(BaseLogTensorStats):
             quantizer=quantizer,
             original_tensor=tensor,
         ) as aux_dict:
+            # Inject oscillation EMA persistent state and NVFP4 tensor data
+            # so the compute functions in stats_computation can access packed
+            # data, scale_inv, amax, and cross-iteration EMA histograms.
+            has_oscillation = any(s in OSCILLATION_STAT_NAMES for s in config["stats"])
+            if has_oscillation:
+                aux_dict["_nvfp4_quantized_tensor"] = quantized_tensor
+                aux_dict["_ema_decay"] = config.get("ema_decay", 0.0)
+                key = (layer_name, tensor_name)
+                if key not in _OSCILLATION_PERSISTENT_STATE:
+                    _OSCILLATION_PERSISTENT_STATE[key] = {}
+                aux_dict["_persistent_state"] = _OSCILLATION_PERSISTENT_STATE[key]
+                aux_dict["_iteration"] = iteration
+
             STATS_BUFFERS.feed(
                 layer_name,
                 tensor_name,

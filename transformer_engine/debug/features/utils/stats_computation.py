@@ -8,11 +8,25 @@ Mathematical functions used to tensor statistics computation.
 
 import math
 from collections import namedtuple
+from typing import Optional
 
 import torch
 import torch.nn.functional as F
 import transformer_engine_torch as tex
 from transformer_engine.common.recipe import Format
+
+OSCILLATION_STAT_NAMES = frozenset(
+    {"oscillation_ratio", "oscillation_l1distqw", "oscillation_l1distw"}
+)
+
+# FP4 E2M1: 16 representable values. Index 0 = +0, index 8 = -0.
+_FP4_E2M1_NUM_BINS = 16
+_FP4_E2M1_NEG_ZERO_INDEX = 8
+# Midpoints between adjacent positive FP4 E2M1 magnitudes (0, 0.5, 1, 1.5, 2, 3, 4, 6).
+# Used with torch.bucketize for memory-efficient bin assignment.
+_FP4_E2M1_POS_BOUNDARIES = [0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0]
+# FP4_MAX * FP8_E4M3_MAX = 6.0 * 448.0, used in NVFP4 two-level scaling.
+_NVFP4_SCALE_FACTOR = 6.0 * 448.0
 
 
 class BlockwiseDynamicRangeStat(
@@ -505,3 +519,235 @@ def add_nvfp4_underflows_stats():
 # Register NVFP4 stats
 add_nvfp4_underflows_stats()
 add_mse_stats("nvfp4")  # Reuse existing MSE function
+
+
+# ---------------------------------------------------------------------------
+# Oscillation ratio: FP4 bin histogram EMA tracking
+# ---------------------------------------------------------------------------
+
+
+def _unpack_fp4_packed(packed: torch.Tensor) -> torch.Tensor:
+    """Unpack uint8 tensor (2 FP4 values per byte) to individual 4-bit bin indices.
+
+    Uses the same approach as TE's canonical ``unpack_fp4`` in the NVFP4
+    test suite (tests/pytorch/nvfp4/test_nvfp4_quantize_exact.py).
+    Each byte encodes [lo_nibble, hi_nibble]: even columns get the low
+    nibble, odd columns get the high nibble.
+    """
+    repeated = packed.repeat_interleave(2, dim=-1)
+    repeated = repeated.clone()  # avoid modifying input
+    repeated[..., 0::2] &= 0x0F
+    repeated[..., 1::2] >>= 4
+    return repeated
+
+
+def _fp4_bin_histogram(bin_indices: torch.Tensor) -> torch.Tensor:
+    """Compute 15-bin histogram from FP4 bin indices, merging +0 into -0.
+
+    Convention: index 0 = +0, index 8 = -0. Merge +0 count into -0,
+    then exclude the +0 bin, yielding 15 bins.
+    """
+    hist = torch.bincount(
+        bin_indices.reshape(-1).long(), minlength=_FP4_E2M1_NUM_BINS
+    ).clone()
+    hist[_FP4_E2M1_NEG_ZERO_INDEX] += hist[0]
+    return hist[1:]  # 15 bins
+
+
+def _latent_to_fp4_bin_index(latent: torch.Tensor, device: torch.device) -> torch.Tensor:
+    """Map latent (encoded) values to FP4 E2M1 bin indices (0-15).
+
+    Uses torch.bucketize on absolute values for memory efficiency (avoids
+    materialising an (N, 16) distance matrix).
+
+    Positive bins 0-7 map to FP4 values [0, 0.5, 1, 1.5, 2, 3, 4, 6].
+    Negative bins 8-15 mirror the positive bins.
+    """
+    boundaries = torch.tensor(_FP4_E2M1_POS_BOUNDARIES, dtype=torch.float32, device=device)
+    pos_bin = torch.bucketize(latent.abs(), boundaries)  # 0..7
+    return torch.where(latent < 0, pos_bin + _FP4_E2M1_NEG_ZERO_INDEX, pos_bin)
+
+
+def nvfp4_qw_histogram(packed_data: torch.Tensor) -> Optional[torch.Tensor]:
+    """Build 15-bin histogram directly from packed NVFP4 quantized data.
+
+    Args:
+        packed_data: uint8 tensor, 2 FP4 values per byte.
+    Returns:
+        Histogram (15,) long tensor, or None if input is invalid/empty.
+    """
+    if packed_data is None or packed_data.numel() == 0 or packed_data.dtype != torch.uint8:
+        return None
+    return _fp4_bin_histogram(_unpack_fp4_packed(packed_data))
+
+
+def nvfp4_w_histogram(
+    w: torch.Tensor,
+    scale_inv_uint8: torch.Tensor,
+    amax: torch.Tensor,
+    block_size: int = 16,
+) -> Optional[torch.Tensor]:
+    """Build 15-bin histogram of which FP4 bin each master weight element maps to.
+
+    Encoding: latent = w * encode_scale, where
+        encode_scale = _NVFP4_SCALE_FACTOR / (amax * float(per_block_scale_inv)).
+    Each latent is rounded to the nearest FP4 E2M1 bin.
+
+    Args:
+        w: Master weight, shape (M, K).
+        scale_inv_uint8: Per-block scale_inv as uint8 (FP8 E4M3 encoded),
+            shape (M_padded, ceil(K/block_size)_padded).
+        amax: Per-tensor amax, float32 scalar tensor.
+        block_size: Elements per quantisation block (16 for NVFP4).
+    Returns:
+        Histogram (15,) long tensor, or None if incompatible/empty.
+    """
+    if (
+        w is None
+        or w.numel() == 0
+        or scale_inv_uint8 is None
+        or amax is None
+        or w.dim() != 2
+    ):
+        return None
+    amax_val = amax.float().item()
+    if amax_val == 0:
+        return None
+    M, K = w.shape
+    if K % block_size != 0:
+        return None
+    num_k_blocks = K // block_size
+
+    # Expand per-block scale to per-element, then decode FP8 E4M3 -> float32.
+    # Follow the same order as TE's Python reference: expand first, then view.
+    scale_expanded = (
+        scale_inv_uint8[:M, :num_k_blocks]
+        .repeat_interleave(block_size, dim=1)[:, :K]
+        .contiguous()
+        .view(torch.float8_e4m3fn)
+        .to(torch.float32)
+    )
+    # Guard zero scales (all-zero blocks).
+    safe_scale = scale_expanded.clamp(min=1e-30)
+    encode_scale = _NVFP4_SCALE_FACTOR / (amax_val * safe_scale)
+    latent = w.float() * encode_scale
+
+    bin_idx = _latent_to_fp4_bin_index(latent, w.device)
+    return _fp4_bin_histogram(bin_idx)
+
+
+def _compute_oscillation_stat(
+    tensor: torch.Tensor, aux_dict: dict, variant: str
+) -> float:
+    """Compute one of the three oscillation scalars using persistent buffer state.
+
+    All three variants (ratio, l1distqw, l1distw) are computed together on the
+    first call per feed() and cached in persistent_state for the remaining two.
+
+    Args:
+        tensor: Original (master) weight tensor.
+        aux_dict: Must contain ``_persistent_state`` (dict surviving across
+            iterations) and ``_nvfp4_quantized_tensor`` (the NVFP4Tensor).
+        variant: One of ``"oscillation_ratio"``, ``"oscillation_l1distqw"``,
+            ``"oscillation_l1distw"``.
+    """
+    persistent_state = aux_dict.get("_persistent_state")
+    if persistent_state is None:
+        return 0.0
+
+    # Per-feed cache: avoid recomputing histograms for the 3 sister stats.
+    iteration = aux_dict.get("_iteration")
+    cache = persistent_state.get("_oscillation_cache")
+    if cache is not None and cache.get("_iter") == iteration:
+        return cache.get(variant, 0.0)
+
+    _ZERO_RESULT = {
+        "_iter": iteration,
+        "oscillation_ratio": 0.0,
+        "oscillation_l1distqw": 0.0,
+        "oscillation_l1distw": 0.0,
+    }
+
+    nvfp4_tensor = aux_dict.get("_nvfp4_quantized_tensor")
+    if nvfp4_tensor is None:
+        persistent_state["_oscillation_cache"] = _ZERO_RESULT
+        return 0.0
+
+    packed_data = getattr(nvfp4_tensor, "_rowwise_data", None)
+    scale_inv = getattr(nvfp4_tensor, "_rowwise_scale_inv", None)
+    amax = getattr(nvfp4_tensor, "_amax_rowwise", None)
+
+    hist_qw = nvfp4_qw_histogram(packed_data)
+    hist_w = nvfp4_w_histogram(tensor, scale_inv, amax)
+
+    if hist_qw is None or hist_w is None:
+        persistent_state["_oscillation_cache"] = _ZERO_RESULT
+        return 0.0
+
+    total_qw = hist_qw.sum().item()
+    total_w = hist_w.sum().item()
+    if total_qw <= 0 or total_w <= 0:
+        persistent_state["_oscillation_cache"] = _ZERO_RESULT
+        return 0.0
+
+    new_qw_norm = hist_qw.float() / total_qw
+    new_w_norm = hist_w.float() / total_w
+
+    ema_decay = aux_dict.get("_ema_decay", 0.0)
+    ema_qw = persistent_state.get("_ema_qw")
+    ema_w = persistent_state.get("_ema_w")
+
+    if ema_qw is None or ema_w is None:
+        # First iteration: seed EMAs, report zeros.
+        persistent_state["_ema_qw"] = new_qw_norm.clone()
+        persistent_state["_ema_w"] = new_w_norm.clone()
+        persistent_state["_oscillation_cache"] = _ZERO_RESULT
+        return 0.0
+
+    # L1 deltas vs previous EMA (before update).
+    l1distqw = (new_qw_norm - ema_qw).abs().sum().item()
+    l1distw = (new_w_norm - ema_w).abs().sum().item()
+
+    # Update EMAs in-place.
+    ema_qw.mul_(ema_decay).add_(new_qw_norm, alpha=1.0 - ema_decay)
+    ema_w.mul_(ema_decay).add_(new_w_norm, alpha=1.0 - ema_decay)
+
+    eps = 1e-12
+    ratio = l1distqw / (l1distw + eps) if l1distw > 0 else 0.0
+
+    result = {
+        "_iter": iteration,
+        "oscillation_ratio": ratio,
+        "oscillation_l1distqw": l1distqw,
+        "oscillation_l1distw": l1distw,
+    }
+    persistent_state["_oscillation_cache"] = result
+    return result[variant]
+
+
+def add_oscillation_ratio_stats():
+    """Register oscillation_ratio, oscillation_l1distqw, oscillation_l1distw."""
+    for stat_name in ("oscillation_ratio", "oscillation_l1distqw", "oscillation_l1distw"):
+        if stat_name in stats_to_num:
+            return  # already registered
+
+    for stat_name in ("oscillation_ratio", "oscillation_l1distqw", "oscillation_l1distw"):
+        stats_to_num[stat_name] = len(stats_to_num)
+        DEPENDENCIES[stat_name] = {stat_name}
+
+    # Each variant delegates to the shared helper which caches per-feed results.
+    STATS["oscillation_ratio"] = (
+        lambda x, aux_dict: _compute_oscillation_stat(x, aux_dict, "oscillation_ratio"),
+        lambda buffers: torch.mean(_get(buffers, "oscillation_ratio")),
+    )
+    STATS["oscillation_l1distqw"] = (
+        lambda x, aux_dict: _compute_oscillation_stat(x, aux_dict, "oscillation_l1distqw"),
+        lambda buffers: torch.mean(_get(buffers, "oscillation_l1distqw")),
+    )
+    STATS["oscillation_l1distw"] = (
+        lambda x, aux_dict: _compute_oscillation_stat(x, aux_dict, "oscillation_l1distw"),
+        lambda buffers: torch.mean(_get(buffers, "oscillation_l1distw")),
+    )
+
+
+add_oscillation_ratio_stats()
