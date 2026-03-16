@@ -16,7 +16,13 @@ import transformer_engine_torch as tex
 from transformer_engine.common.recipe import Format
 
 OSCILLATION_STAT_NAMES = frozenset(
-    {"oscillation_ratio", "oscillation_l1distqw", "oscillation_l1distw"}
+    {
+        "oscillation_ratio",
+        "oscillation_ratio_reduced",
+        "oscillation_l1distqw",
+        "oscillation_l1distw",
+        "oscillation_l1distw_reduced",
+    }
 )
 
 # FP4 E2M1: 16 representable values. Index 0 = +0, index 8 = -0.
@@ -27,6 +33,53 @@ _FP4_E2M1_NEG_ZERO_INDEX = 8
 _FP4_E2M1_POS_BOUNDARIES = [0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0]
 # FP4_MAX * FP8_E4M3_MAX = 6.0 * 448.0, used in NVFP4 two-level scaling.
 _NVFP4_SCALE_FACTOR = 6.0 * 448.0
+
+# Finer master-weight binning (2× FP4 resolution) for oscillation detection.
+# Boundaries at quarter-points between FP4 values and FP4 midpoints so that
+# FP4 quantization thresholds (0.25, 0.75, …) land at bin CENTERS, not edges.
+# Small master-weight oscillations near a quantization boundary stay in one
+# master bin while the quantized histogram flips → ratio correctly spikes.
+_MASTER_W_NUM_BINS = 30  # 15 positive + 15 negative
+_MASTER_W_NEG_ZERO_INDEX = 15  # index of -0
+_MASTER_W_POS_BOUNDARIES = [
+    0.125, 0.375, 0.625, 0.875,
+    1.125, 1.375, 1.625, 1.875,
+    2.25, 2.75, 3.25, 3.75, 4.5, 5.5,
+]
+
+_MASTER_29_TO_15_COARSE_INDEX = (
+    0,
+    0,
+    1,
+    1,
+    2,
+    2,
+    3,
+    3,
+    4,
+    4,
+    5,
+    5,
+    6,
+    6,
+    7,
+    8,
+    8,
+    9,
+    9,
+    10,
+    10,
+    11,
+    11,
+    12,
+    12,
+    13,
+    13,
+    14,
+    14,
+)
+
+_HISTOGRAM_LATENT_CHUNK_ELEMS = 1 << 20
 
 
 class BlockwiseDynamicRangeStat(
@@ -554,6 +607,45 @@ def _fp4_bin_histogram(bin_indices: torch.Tensor) -> torch.Tensor:
     return hist[1:]  # 15 bins
 
 
+def _master_w_bin_histogram(bin_indices: torch.Tensor) -> torch.Tensor:
+    """Compute 29-bin histogram from finer master-weight bin indices, merging +0 into -0.
+
+    Convention mirrors _fp4_bin_histogram: index 0 = +0, index 15 = -0.
+    Merge +0 count into -0, then exclude the +0 bin, yielding 29 bins.
+    """
+    hist = torch.bincount(
+        bin_indices.reshape(-1).long(), minlength=_MASTER_W_NUM_BINS
+    ).clone()
+    hist[_MASTER_W_NEG_ZERO_INDEX] += hist[0]
+    return hist[1:]  # 29 bins
+
+
+def _reduce_master_histogram_29_to_15(hist_29: torch.Tensor) -> torch.Tensor:
+    """Reduce 29-bin master histogram to the same 15-bin space as qw."""
+    if hist_29.dim() != 1 or hist_29.shape[0] != 29:
+        raise ValueError("hist_29 must be 1D of length 29")
+    out = hist_29.new_zeros(15)
+    for i, coarse_idx in enumerate(_MASTER_29_TO_15_COARSE_INDEX):
+        out[coarse_idx] += hist_29[i]
+    return out
+
+
+def _latent_to_master_bin_index(latent: torch.Tensor, device: torch.device) -> torch.Tensor:
+    """Map latent values to finer master-weight bin indices (0-29).
+
+    Uses 2× FP4 resolution with quarter-point boundaries so that FP4
+    quantization thresholds fall at bin centers.  Small oscillations near
+    a boundary stay in one master bin.
+
+    Positive bins 0-14, negative bins 15-29.
+    """
+    boundaries = torch.tensor(
+        _MASTER_W_POS_BOUNDARIES, dtype=torch.float32, device=device
+    )
+    pos_bin = torch.bucketize(latent.abs(), boundaries)  # 0..14
+    return torch.where(latent < 0, pos_bin + _MASTER_W_NEG_ZERO_INDEX, pos_bin)
+
+
 def _latent_to_fp4_bin_index(latent: torch.Tensor, device: torch.device) -> torch.Tensor:
     """Map latent (encoded) values to FP4 E2M1 bin indices (0-15).
 
@@ -587,11 +679,15 @@ def nvfp4_w_histogram(
     amax: torch.Tensor,
     block_size: int = 16,
 ) -> Optional[torch.Tensor]:
-    """Build 15-bin histogram of which FP4 bin each master weight element maps to.
+    """Build 29-bin histogram of master weights using 2× FP4 resolution.
+
+    Uses quarter-point boundaries so FP4 quantization thresholds land at
+    bin centers.  This makes the master histogram insensitive to small
+    oscillations near FP4 bin boundaries while the quantized histogram
+    flips — improving oscillation-ratio detection.
 
     Encoding: latent = w * encode_scale, where
         encode_scale = _NVFP4_SCALE_FACTOR / (amax * float(per_block_scale_inv)).
-    Each latent is rounded to the nearest FP4 E2M1 bin.
 
     Args:
         w: Master weight, shape (M, K).
@@ -600,7 +696,7 @@ def nvfp4_w_histogram(
         amax: Per-tensor amax, float32 scalar tensor.
         block_size: Elements per quantisation block (16 for NVFP4).
     Returns:
-        Histogram (15,) long tensor, or None if incompatible/empty.
+        Histogram (29,) long tensor, or None if incompatible/empty.
     """
     if (
         w is None
@@ -618,44 +714,62 @@ def nvfp4_w_histogram(
         return None
     num_k_blocks = K // block_size
 
-    # Expand per-block scale to per-element, then decode FP8 E4M3 -> float32.
-    # Follow the same order as TE's Python reference: expand first, then view.
-    scale_expanded = (
-        scale_inv_uint8[:M, :num_k_blocks]
-        .repeat_interleave(block_size, dim=1)[:, :K]
-        .contiguous()
-        .view(torch.float8_e4m3fn)
-        .to(torch.float32)
-    )
-    # Guard zero scales (all-zero blocks).
-    safe_scale = scale_expanded.clamp(min=1e-30)
-    encode_scale = _NVFP4_SCALE_FACTOR / (amax_val * safe_scale)
-    latent = w.float() * encode_scale
+    scale_inv_view = scale_inv_uint8[:M, :num_k_blocks]
+    boundaries = torch.tensor(_MASTER_W_POS_BOUNDARIES, dtype=torch.float32, device=w.device)
+    hist = torch.zeros(_MASTER_W_NUM_BINS, dtype=torch.long, device=w.device)
+    any_valid = False
 
-    bin_idx = _latent_to_fp4_bin_index(latent, w.device)
-    return _fp4_bin_histogram(bin_idx)
+    row_chunk = max(1, _HISTOGRAM_LATENT_CHUNK_ELEMS // K)
+    for r_start in range(0, M, row_chunk):
+        r_end = min(r_start + row_chunk, M)
+        w_chunk = w[r_start:r_end, :].float()
+        scale_chunk = (
+            scale_inv_view[r_start:r_end, :]
+            .repeat_interleave(block_size, dim=1)[:, :K]
+            .contiguous()
+            .view(torch.float8_e4m3fn)
+            .to(torch.float32)
+        )
+        safe_scale = scale_chunk.clamp(min=1e-30)
+        encode_scale = _NVFP4_SCALE_FACTOR / (amax_val * safe_scale)
+        latent_chunk = (w_chunk * encode_scale).reshape(-1)
+        valid = torch.isfinite(latent_chunk)
+        if not valid.any():
+            continue
+        any_valid = True
+        latent_chunk = latent_chunk[valid]
+        pos_bin = torch.bucketize(latent_chunk.abs(), boundaries)
+        bin_idx = torch.where(latent_chunk < 0, pos_bin + _MASTER_W_NEG_ZERO_INDEX, pos_bin)
+        hist += torch.bincount(bin_idx, minlength=_MASTER_W_NUM_BINS)
+
+    if not any_valid:
+        return None
+
+    hist[_MASTER_W_NEG_ZERO_INDEX] += hist[0]
+    return hist[1:]  # 29 bins
 
 
 def _compute_oscillation_stat(
     tensor: torch.Tensor, aux_dict: dict, variant: str
 ) -> float:
-    """Compute one of the three oscillation scalars using persistent buffer state.
+    """Compute one oscillation scalar using persistent buffer state.
 
-    All three variants (ratio, l1distqw, l1distw) are computed together on the
-    first call per feed() and cached in persistent_state for the remaining two.
+    All oscillation variants are computed together on the first call per feed()
+    and cached in persistent_state for the remaining sibling stats.
 
     Args:
         tensor: Original (master) weight tensor.
         aux_dict: Must contain ``_persistent_state`` (dict surviving across
             iterations) and ``_nvfp4_quantized_tensor`` (the NVFP4Tensor).
-        variant: One of ``"oscillation_ratio"``, ``"oscillation_l1distqw"``,
-            ``"oscillation_l1distw"``.
+        variant: One of ``"oscillation_ratio"``, ``"oscillation_ratio_reduced"``,
+            ``"oscillation_l1distqw"``, ``"oscillation_l1distw"``, or
+            ``"oscillation_l1distw_reduced"``.
     """
     persistent_state = aux_dict.get("_persistent_state")
     if persistent_state is None:
         return 0.0
 
-    # Per-feed cache: avoid recomputing histograms for the 3 sister stats.
+    # Per-feed cache: avoid recomputing histograms for the sibling oscillation stats.
     iteration = aux_dict.get("_iteration")
     cache = persistent_state.get("_oscillation_cache")
     if cache is not None and cache.get("_iter") == iteration:
@@ -664,8 +778,10 @@ def _compute_oscillation_stat(
     _ZERO_RESULT = {
         "_iter": iteration,
         "oscillation_ratio": 0.0,
+        "oscillation_ratio_reduced": 0.0,
         "oscillation_l1distqw": 0.0,
         "oscillation_l1distw": 0.0,
+        "oscillation_l1distw_reduced": 0.0,
     }
 
     nvfp4_tensor = aux_dict.get("_nvfp4_quantized_tensor")
@@ -697,6 +813,11 @@ def _compute_oscillation_stat(
     ema_qw = persistent_state.get("_ema_qw")
     ema_w = persistent_state.get("_ema_w")
 
+    # Handle histogram size change (e.g. 15-bin → 29-bin master upgrade).
+    if ema_w is not None and ema_w.shape != new_w_norm.shape:
+        ema_qw = None
+        ema_w = None
+
     if ema_qw is None or ema_w is None:
         # First iteration: seed EMAs, report zeros.
         persistent_state["_ema_qw"] = new_qw_norm.clone()
@@ -707,6 +828,9 @@ def _compute_oscillation_stat(
     # L1 deltas vs previous EMA (before update).
     l1distqw = (new_qw_norm - ema_qw).abs().sum().item()
     l1distw = (new_w_norm - ema_w).abs().sum().item()
+    new_w_reduced = _reduce_master_histogram_29_to_15(new_w_norm)
+    ema_w_reduced = _reduce_master_histogram_29_to_15(ema_w)
+    l1distw_reduced = (new_w_reduced - ema_w_reduced).abs().sum().item()
 
     # Update EMAs in-place.
     ema_qw.mul_(ema_decay).add_(new_qw_norm, alpha=1.0 - ema_decay)
@@ -714,40 +838,34 @@ def _compute_oscillation_stat(
 
     eps = 1e-12
     ratio = l1distqw / (l1distw + eps) if l1distw > 0 else 0.0
+    ratio_reduced = l1distqw / (l1distw_reduced + eps) if l1distw_reduced > 0 else 0.0
 
     result = {
         "_iter": iteration,
         "oscillation_ratio": ratio,
+        "oscillation_ratio_reduced": ratio_reduced,
         "oscillation_l1distqw": l1distqw,
         "oscillation_l1distw": l1distw,
+        "oscillation_l1distw_reduced": l1distw_reduced,
     }
     persistent_state["_oscillation_cache"] = result
     return result[variant]
 
 
 def add_oscillation_ratio_stats():
-    """Register oscillation_ratio, oscillation_l1distqw, oscillation_l1distw."""
-    for stat_name in ("oscillation_ratio", "oscillation_l1distqw", "oscillation_l1distw"):
-        if stat_name in stats_to_num:
-            return  # already registered
+    """Register kitchen-aligned oscillation stats for NVFP4 tensors."""
+    if OSCILLATION_STAT_NAMES.issubset(stats_to_num):
+        return
 
-    for stat_name in ("oscillation_ratio", "oscillation_l1distqw", "oscillation_l1distw"):
-        stats_to_num[stat_name] = len(stats_to_num)
+    for stat_name in OSCILLATION_STAT_NAMES:
+        if stat_name not in stats_to_num:
+            stats_to_num[stat_name] = len(stats_to_num)
         DEPENDENCIES[stat_name] = {stat_name}
-
-    # Each variant delegates to the shared helper which caches per-feed results.
-    STATS["oscillation_ratio"] = (
-        lambda x, aux_dict: _compute_oscillation_stat(x, aux_dict, "oscillation_ratio"),
-        lambda buffers: torch.mean(_get(buffers, "oscillation_ratio")),
-    )
-    STATS["oscillation_l1distqw"] = (
-        lambda x, aux_dict: _compute_oscillation_stat(x, aux_dict, "oscillation_l1distqw"),
-        lambda buffers: torch.mean(_get(buffers, "oscillation_l1distqw")),
-    )
-    STATS["oscillation_l1distw"] = (
-        lambda x, aux_dict: _compute_oscillation_stat(x, aux_dict, "oscillation_l1distw"),
-        lambda buffers: torch.mean(_get(buffers, "oscillation_l1distw")),
-    )
+        # Each variant delegates to the shared helper which caches per-feed results.
+        STATS[stat_name] = (
+            lambda x, aux_dict, variant=stat_name: _compute_oscillation_stat(x, aux_dict, variant),
+            lambda buffers, variant=stat_name: torch.mean(_get(buffers, variant)),
+        )
 
 
 add_oscillation_ratio_stats()
