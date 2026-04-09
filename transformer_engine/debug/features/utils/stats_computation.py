@@ -31,6 +31,10 @@ _FP4_E2M1_NEG_ZERO_INDEX = 8
 # Midpoints between adjacent positive FP4 E2M1 magnitudes (0, 0.5, 1, 1.5, 2, 3, 4, 6).
 # Used with torch.bucketize for memory-efficient bin assignment.
 _FP4_E2M1_POS_BOUNDARIES = [0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0]
+_FP4_E2M1_BIN_CENTERS = [
+    0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
+    -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,
+]
 # FP4_MAX * FP8_E4M3_MAX = 6.0 * 448.0, used in NVFP4 two-level scaling.
 _NVFP4_SCALE_FACTOR = 6.0 * 448.0
 
@@ -45,6 +49,14 @@ _MASTER_W_POS_BOUNDARIES = [
     0.125, 0.375, 0.625, 0.875,
     1.125, 1.375, 1.625, 1.875,
     2.25, 2.75, 3.25, 3.75, 4.5, 5.5,
+]
+_MASTER_W_BIN_CENTERS = [
+    0.0, 0.25, 0.5, 0.75,
+    1.0, 1.25, 1.5, 1.75,
+    2.0, 2.5, 3.0, 3.5, 4.0, 5.0, 6.0,
+    -0.0, -0.25, -0.5, -0.75,
+    -1.0, -1.25, -1.5, -1.75,
+    -2.0, -2.5, -3.0, -3.5, -4.0, -5.0, -6.0,
 ]
 
 _MASTER_29_TO_15_COARSE_INDEX = (
@@ -747,6 +759,283 @@ def nvfp4_w_histogram(
 
     hist[_MASTER_W_NEG_ZERO_INDEX] += hist[0]
     return hist[1:]  # 29 bins
+
+
+def nvfp4_master_hist_bin_center_weight(
+    w: torch.Tensor,
+    scale_inv_uint8: torch.Tensor,
+    amax: torch.Tensor,
+    block_size: int = 16,
+) -> Optional[torch.Tensor]:
+    """Project weights onto the same 30-bin master-histogram centers used by oscillation stats.
+
+    Returns a float32 tensor in weight space. Each element is encoded with the same
+    ``latent = w * encode_scale`` mapping as ``nvfp4_w_histogram``, snapped to the nearest
+    master-histogram bin center in latent space, and decoded back to weight space.
+    """
+    if (
+        w is None
+        or w.numel() == 0
+        or scale_inv_uint8 is None
+        or amax is None
+        or w.dim() != 2
+    ):
+        return None
+    amax_val = amax.float().item()
+    if amax_val == 0:
+        return None
+    M, K = w.shape
+    if K % block_size != 0:
+        return None
+    num_k_blocks = K // block_size
+
+    scale_inv_view = scale_inv_uint8[:M, :num_k_blocks]
+    centers = torch.tensor(_MASTER_W_BIN_CENTERS, dtype=torch.float32, device=w.device)
+    projected = torch.empty((M, K), dtype=torch.float32, device=w.device)
+    any_valid = False
+
+    row_chunk = max(1, _HISTOGRAM_LATENT_CHUNK_ELEMS // K)
+    for r_start in range(0, M, row_chunk):
+        r_end = min(r_start + row_chunk, M)
+        w_chunk = w[r_start:r_end, :].float()
+        scale_chunk = (
+            scale_inv_view[r_start:r_end, :]
+            .repeat_interleave(block_size, dim=1)[:, :K]
+            .contiguous()
+            .view(torch.float8_e4m3fn)
+            .to(torch.float32)
+        )
+        if not torch.isfinite(w_chunk).all() or not torch.isfinite(scale_chunk).all():
+            return None
+        safe_scale = scale_chunk.clamp(min=1e-30)
+        encode_scale = _NVFP4_SCALE_FACTOR / (amax_val * safe_scale)
+        latent_chunk = w_chunk * encode_scale
+        if not torch.isfinite(latent_chunk).all():
+            return None
+        any_valid = True
+        bin_idx = _latent_to_master_bin_index(latent_chunk, w.device)
+        projected[r_start:r_end, :] = centers[bin_idx.long()] / encode_scale
+
+    if not any_valid:
+        return None
+    return projected
+
+
+def nvfp4_quant_bin_center_weight(
+    w: torch.Tensor,
+    scale_inv_uint8: torch.Tensor,
+    amax: torch.Tensor,
+    block_size: int = 16,
+) -> Optional[torch.Tensor]:
+    """Project weights onto the NVFP4 15-bin quantization centers used by qw_hist."""
+    if (
+        w is None
+        or w.numel() == 0
+        or scale_inv_uint8 is None
+        or amax is None
+        or w.dim() != 2
+    ):
+        return None
+    amax_val = amax.float().item()
+    if amax_val == 0:
+        return None
+    M, K = w.shape
+    if K % block_size != 0:
+        return None
+    num_k_blocks = K // block_size
+
+    scale_inv_view = scale_inv_uint8[:M, :num_k_blocks]
+    centers = torch.tensor(_FP4_E2M1_BIN_CENTERS, dtype=torch.float32, device=w.device)
+    projected = torch.empty((M, K), dtype=torch.float32, device=w.device)
+    any_valid = False
+
+    row_chunk = max(1, _HISTOGRAM_LATENT_CHUNK_ELEMS // K)
+    for r_start in range(0, M, row_chunk):
+        r_end = min(r_start + row_chunk, M)
+        w_chunk = w[r_start:r_end, :].float()
+        scale_chunk = (
+            scale_inv_view[r_start:r_end, :]
+            .repeat_interleave(block_size, dim=1)[:, :K]
+            .contiguous()
+            .view(torch.float8_e4m3fn)
+            .to(torch.float32)
+        )
+        if not torch.isfinite(w_chunk).all() or not torch.isfinite(scale_chunk).all():
+            return None
+        safe_scale = scale_chunk.clamp(min=1e-30)
+        encode_scale = _NVFP4_SCALE_FACTOR / (amax_val * safe_scale)
+        latent_chunk = w_chunk * encode_scale
+        if not torch.isfinite(latent_chunk).all():
+            return None
+        any_valid = True
+        bin_idx = _latent_to_fp4_bin_index(latent_chunk, w.device)
+        projected[r_start:r_end, :] = centers[bin_idx.long()] / encode_scale
+
+    if not any_valid:
+        return None
+    return projected
+
+
+def nvfp4_master_hist_bin_center_weight_shard(
+    w: torch.Tensor,
+    scale_inv_uint8: torch.Tensor,
+    amax: torch.Tensor,
+    flat_start: int,
+    flat_end: int,
+    dst_dtype: torch.dtype = torch.float32,
+    dst_device: Optional[torch.device] = None,
+    block_size: int = 16,
+) -> Optional[torch.Tensor]:
+    """Project only a flattened row-major slice of weights onto master-histogram centers.
+
+    This is equivalent to ``nvfp4_master_hist_bin_center_weight(...).view(-1)[flat_start:flat_end]``,
+    but it only materializes chunk-sized temporaries instead of a full projected tensor.
+    """
+    if (
+        w is None
+        or w.numel() == 0
+        or scale_inv_uint8 is None
+        or amax is None
+        or w.dim() != 2
+    ):
+        return None
+    amax_val = amax.float().item()
+    if amax_val == 0:
+        return None
+    M, K = w.shape
+    total_numel = M * K
+    if K % block_size != 0:
+        return None
+    if flat_start < 0 or flat_end < flat_start or flat_end > total_numel:
+        return None
+    if dst_device is None:
+        dst_device = w.device
+    num_k_blocks = K // block_size
+
+    scale_inv_view = scale_inv_uint8[:M, :num_k_blocks]
+    centers = torch.tensor(_MASTER_W_BIN_CENTERS, dtype=torch.float32, device=w.device)
+    projected_shard = torch.empty(flat_end - flat_start, dtype=dst_dtype, device=dst_device)
+    any_valid = False
+    write_offset = 0
+
+    row_chunk = max(1, _HISTOGRAM_LATENT_CHUNK_ELEMS // K)
+    for r_start in range(0, M, row_chunk):
+        r_end = min(r_start + row_chunk, M)
+        chunk_flat_start = r_start * K
+        chunk_flat_end = r_end * K
+        overlap_start = max(flat_start, chunk_flat_start)
+        overlap_end = min(flat_end, chunk_flat_end)
+        if overlap_start >= overlap_end:
+            continue
+
+        w_chunk = w[r_start:r_end, :].float()
+        scale_chunk = (
+            scale_inv_view[r_start:r_end, :]
+            .repeat_interleave(block_size, dim=1)[:, :K]
+            .contiguous()
+            .view(torch.float8_e4m3fn)
+            .to(torch.float32)
+        )
+        if not torch.isfinite(w_chunk).all() or not torch.isfinite(scale_chunk).all():
+            return None
+        safe_scale = scale_chunk.clamp(min=1e-30)
+        encode_scale = _NVFP4_SCALE_FACTOR / (amax_val * safe_scale)
+        latent_chunk = w_chunk * encode_scale
+        if not torch.isfinite(latent_chunk).all():
+            return None
+        any_valid = True
+        bin_idx = _latent_to_master_bin_index(latent_chunk, w.device)
+        projected_chunk = (centers[bin_idx.long()] / encode_scale).reshape(-1)
+
+        local_start = overlap_start - chunk_flat_start
+        local_end = overlap_end - chunk_flat_start
+        shard_piece = projected_chunk[local_start:local_end].to(device=dst_device, dtype=dst_dtype)
+        next_write_offset = write_offset + shard_piece.numel()
+        projected_shard[write_offset:next_write_offset].copy_(shard_piece)
+        write_offset = next_write_offset
+
+    if not any_valid or write_offset != flat_end - flat_start:
+        return None
+    return projected_shard
+
+
+def nvfp4_quant_bin_center_weight_shard(
+    w: torch.Tensor,
+    scale_inv_uint8: torch.Tensor,
+    amax: torch.Tensor,
+    flat_start: int,
+    flat_end: int,
+    dst_dtype: torch.dtype = torch.float32,
+    dst_device: Optional[torch.device] = None,
+    block_size: int = 16,
+) -> Optional[torch.Tensor]:
+    """Project only a flattened row-major slice of weights onto NVFP4 quant bin centers."""
+    if (
+        w is None
+        or w.numel() == 0
+        or scale_inv_uint8 is None
+        or amax is None
+        or w.dim() != 2
+    ):
+        return None
+    amax_val = amax.float().item()
+    if amax_val == 0:
+        return None
+    M, K = w.shape
+    total_numel = M * K
+    if K % block_size != 0:
+        return None
+    if flat_start < 0 or flat_end < flat_start or flat_end > total_numel:
+        return None
+    if dst_device is None:
+        dst_device = w.device
+    num_k_blocks = K // block_size
+
+    scale_inv_view = scale_inv_uint8[:M, :num_k_blocks]
+    centers = torch.tensor(_FP4_E2M1_BIN_CENTERS, dtype=torch.float32, device=w.device)
+    projected_shard = torch.empty(flat_end - flat_start, dtype=dst_dtype, device=dst_device)
+    any_valid = False
+    write_offset = 0
+
+    row_chunk = max(1, _HISTOGRAM_LATENT_CHUNK_ELEMS // K)
+    for r_start in range(0, M, row_chunk):
+        r_end = min(r_start + row_chunk, M)
+        chunk_flat_start = r_start * K
+        chunk_flat_end = r_end * K
+        overlap_start = max(flat_start, chunk_flat_start)
+        overlap_end = min(flat_end, chunk_flat_end)
+        if overlap_start >= overlap_end:
+            continue
+
+        w_chunk = w[r_start:r_end, :].float()
+        scale_chunk = (
+            scale_inv_view[r_start:r_end, :]
+            .repeat_interleave(block_size, dim=1)[:, :K]
+            .contiguous()
+            .view(torch.float8_e4m3fn)
+            .to(torch.float32)
+        )
+        if not torch.isfinite(w_chunk).all() or not torch.isfinite(scale_chunk).all():
+            return None
+        safe_scale = scale_chunk.clamp(min=1e-30)
+        encode_scale = _NVFP4_SCALE_FACTOR / (amax_val * safe_scale)
+        latent_chunk = w_chunk * encode_scale
+        if not torch.isfinite(latent_chunk).all():
+            return None
+        any_valid = True
+        bin_idx = _latent_to_fp4_bin_index(latent_chunk, w.device)
+        projected_chunk = (centers[bin_idx.long()] / encode_scale).reshape(-1)
+
+        local_start = overlap_start - chunk_flat_start
+        local_end = overlap_end - chunk_flat_start
+        shard_piece = projected_chunk[local_start:local_end].to(device=dst_device, dtype=dst_dtype)
+        next_write_offset = write_offset + shard_piece.numel()
+        projected_shard[write_offset:next_write_offset].copy_(shard_piece)
+        write_offset = next_write_offset
+
+    if not any_valid or write_offset != flat_end - flat_start:
+        return None
+    return projected_shard
 
 
 def _compute_oscillation_stat(

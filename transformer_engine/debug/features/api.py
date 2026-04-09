@@ -536,12 +536,23 @@ class TransformerEngineAPI(BaseNamespaceAPI):
     def step(self):
         """This function is called by the nvidia-dlframework-inspect after every debug_api.step()"""
         STATS_BUFFERS.log_stats()
+        from transformer_engine.debug.features.log_nvfp4_tensor_stats import (
+            _OSCILLATION_LIVE_METADATA,
+        )
+
+        for live_metadata in _OSCILLATION_LIVE_METADATA.values():
+            live_metadata.clear()
+        _OSCILLATION_LIVE_METADATA.clear()
 
     def end_debug(self):
         """This function is called by the nvidia-dlframework-inspect after every debug_api.end_debug()"""
         from transformer_engine.debug.features.log_nvfp4_tensor_stats import (
+            _OSCILLATION_LIVE_METADATA,
             _OSCILLATION_PERSISTENT_STATE,
         )
 
+        for live_metadata in _OSCILLATION_LIVE_METADATA.values():
+            live_metadata.clear()
+        _OSCILLATION_LIVE_METADATA.clear()
         _OSCILLATION_PERSISTENT_STATE.clear()
         TEDebugState._reset()

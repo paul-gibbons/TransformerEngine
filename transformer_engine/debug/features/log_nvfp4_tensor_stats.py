@@ -18,12 +18,17 @@ from transformer_engine.debug.features.utils.stats_buffer import STATS_BUFFERS
 from transformer_engine.pytorch.tensor import Quantizer, QuantizedTensor
 from transformer_engine.pytorch.tensor.nvfp4_tensor import NVFP4Quantizer
 from transformer_engine.debug.features.utils import get_reduction_params, next_enabled_iter
-from transformer_engine.debug.features.utils.stats_computation import OSCILLATION_STAT_NAMES
+from transformer_engine.debug.features.utils.stats_computation import (
+    OSCILLATION_STAT_NAMES,
+)
 from transformer_engine.pytorch.tensor.storage.nvfp4_tensor_storage import NVFP4TensorStorage
 
 # Module-level persistent state for oscillation EMA, keyed by (layer_name, tensor_name).
 # Survives across log() resets; cleared on end_debug().
 _OSCILLATION_PERSISTENT_STATE: Dict[tuple, dict] = {}
+# Step-local oscillation metadata needed for on-demand reset. Cleared after each debug_api.step().
+_OSCILLATION_LIVE_METADATA: Dict[tuple, dict] = {}
+_TE_OSCI_LIVE_METADATA_ATTR = "_te_osci_live_metadata"
 
 
 @Registry.register_feature(namespace="transformer_engine")
@@ -242,7 +247,20 @@ class LogNvfp4TensorStats(BaseLogTensorStats):
                 key = (layer_name, tensor_name)
                 if key not in _OSCILLATION_PERSISTENT_STATE:
                     _OSCILLATION_PERSISTENT_STATE[key] = {}
-                aux_dict["_persistent_state"] = _OSCILLATION_PERSISTENT_STATE[key]
+                persistent_state = _OSCILLATION_PERSISTENT_STATE[key]
+                persistent_state["_latest_iteration"] = iteration
+                _OSCILLATION_LIVE_METADATA[key] = {
+                    "iteration": iteration,
+                    "scale_inv": getattr(quantized_tensor, "_rowwise_scale_inv", None),
+                    "amax": getattr(quantized_tensor, "_amax_rowwise", None),
+                }
+                try:
+                    tensor._te_osci_persistent_state = persistent_state
+                    tensor._te_osci_key = key
+                    tensor._te_osci_live_metadata = _OSCILLATION_LIVE_METADATA[key]
+                except AttributeError:
+                    pass
+                aux_dict["_persistent_state"] = persistent_state
                 aux_dict["_iteration"] = iteration
 
             STATS_BUFFERS.feed(
